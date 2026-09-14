@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_gen_ai_chat_ui/flutter_gen_ai_chat_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:nobodywho/nobodywho.dart' as nobodywho;
+import 'package:nobodywho_android_runner/accounting.dart';
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 Future<void> main() async {
@@ -25,6 +27,152 @@ class MainApp extends StatelessWidget {
   }
 }
 
+class ThinkParts {
+  const ThinkParts({required this.answer, required this.thinking});
+
+  final String answer;
+  final String thinking;
+}
+
+ThinkParts splitThinkBlocksForDisplay(String text) {
+  const openTag = '<think>';
+  const closeTag = '</think>';
+  final lower = text.toLowerCase();
+  final answer = StringBuffer();
+  final thinking = StringBuffer();
+  var hidden = false;
+  var index = 0;
+
+  while (index < text.length) {
+    if (!hidden && lower.startsWith(openTag, index)) {
+      hidden = true;
+      index += openTag.length;
+      continue;
+    }
+    if (hidden && lower.startsWith(closeTag, index)) {
+      hidden = false;
+      index += closeTag.length;
+      continue;
+    }
+    if (!hidden && _isPartialTagAtEnd(lower, index, openTag)) break;
+    if (hidden && _isPartialTagAtEnd(lower, index, closeTag)) break;
+    if (hidden) {
+      thinking.write(text[index]);
+    } else {
+      answer.write(text[index]);
+    }
+    index++;
+  }
+
+  return ThinkParts(
+    answer: answer.toString().replaceFirst(RegExp(r'^\s+'), ''),
+    thinking: thinking.toString().trim(),
+  );
+}
+
+bool _isPartialTagAtEnd(String lower, int index, String tag) {
+  final remaining = lower.length - index;
+  if (remaining >= tag.length) return false;
+  return tag.startsWith(lower.substring(index));
+}
+
+Widget? buildThinkingFooter(
+  BuildContext context,
+  ChatMessage message,
+  bool isUser,
+) {
+  final thinking = (message.customProperties?['thinking'] as String? ?? '')
+      .trim();
+  if (isUser || thinking.isEmpty) return null;
+
+  return ThinkingFooter(
+    thinking: thinking,
+    isStreaming: message.customProperties?['isStreaming'] == true,
+    collapsedLabel: '思考过程',
+    streamingLabel: '思考中',
+  );
+}
+
+class ThinkingFooter extends StatefulWidget {
+  const ThinkingFooter({
+    super.key,
+    required this.thinking,
+    required this.isStreaming,
+    required this.collapsedLabel,
+    required this.streamingLabel,
+  });
+
+  final String thinking;
+  final bool isStreaming;
+  final String collapsedLabel;
+  final String streamingLabel;
+
+  @override
+  State<ThinkingFooter> createState() => _ThinkingFooterState();
+}
+
+class _ThinkingFooterState extends State<ThinkingFooter> {
+  late bool _expanded = widget.isStreaming;
+
+  @override
+  void didUpdateWidget(covariant ThinkingFooter oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isStreaming) {
+      _expanded = true;
+    } else if (oldWidget.isStreaming) {
+      _expanded = false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          borderRadius: BorderRadius.circular(999),
+          onTap: () => setState(() => _expanded = !_expanded),
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Text(
+              widget.isStreaming
+                  ? widget.streamingLabel
+                  : widget.collapsedLabel,
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: colors.onSurfaceVariant,
+                decoration: TextDecoration.underline,
+              ),
+            ),
+          ),
+        ),
+        if (_expanded)
+          Container(
+            margin: const EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.all(10),
+            constraints: const BoxConstraints(maxHeight: 160),
+            decoration: BoxDecoration(
+              color: colors.surface,
+              border: Border.all(color: colors.outlineVariant),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: SingleChildScrollView(
+              child: SelectableText(
+                widget.thinking,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: colors.onSurfaceVariant,
+                  height: 1.45,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
 class ChatPage extends StatefulWidget {
   const ChatPage({super.key});
 
@@ -38,7 +186,9 @@ class _ChatPageState extends State<ChatPage> {
   final _ai = const ChatUser(id: 'nobodywho', name: 'NobodyWho');
 
   nobodywho.Chat? _chat;
+  Future<ExpenseLedger>? _ledger;
   bool _isLoading = false;
+  int _tabIndex = 0;
   String _status = '首次提问时加载模型';
 
   @override
@@ -66,7 +216,14 @@ class _ChatPageState extends State<ChatPage> {
 
     final chat = await nobodywho.Chat.fromPath(
       modelPath: model.path,
-      systemPrompt: '你是一个简洁、可靠的中文助手。',
+      templateVariables: {'enable_thinking': true},
+      systemPrompt:
+          '你是一个简洁、可靠的中文助手。'
+          '当前时间是 ${DateTime.now().toIso8601String()}。'
+          '当用户明确要求记账时，必须调用 record_transaction 工具保存收入或支出。'
+          '提取 occurredAt、type、title、amount、currency、category、account、note、rawText；'
+          '例如“三块钱早餐记账”应保存 type=expense, title=早餐, amount=3, currency=CNY, category=餐饮。',
+      tools: [createRecordTransactionTool(_loadLedger())],
     );
 
     if (mounted) {
@@ -77,6 +234,17 @@ class _ChatPageState extends State<ChatPage> {
     }
 
     return chat;
+  }
+
+  Future<ExpenseLedger> _loadLedger() async {
+    final existing = _ledger;
+    if (existing != null) return existing;
+
+    final future = getApplicationDocumentsDirectory().then(
+      (dir) => ExpenseLedger.open(p.join(dir.path, 'expenses.db')),
+    );
+    _ledger = future;
+    return future;
   }
 
   Future<void> _send(ChatMessage message) async {
@@ -108,26 +276,50 @@ class _ChatPageState extends State<ChatPage> {
       final now = DateTime.now();
       if (!done && now.difference(lastFlush).inMilliseconds < 50) return;
       lastFlush = now;
+      final parts = splitThinkBlocksForDisplay(buffer.toString());
 
       _controller.updateMessage(
         ChatMessage(
-          text: buffer.toString(),
+          text: parts.answer,
           user: _ai,
           createdAt: response.createdAt,
           isMarkdown: done,
-          customProperties: {'id': responseId, if (!done) 'isStreaming': true},
+          customProperties: {
+            'id': responseId,
+            'thinking': parts.thinking,
+            if (!done) 'isStreaming': true,
+          },
         ),
       );
     }
 
     try {
       final chat = await _loadChat();
+      final stopwatch = Stopwatch()..start();
+      var outputTokens = 0;
+      Duration? firstTokenLatency;
       await for (final token in chat.ask(message.text)) {
+        firstTokenLatency ??= stopwatch.elapsed;
+        outputTokens++;
         buffer.write(token);
         flushResponse();
       }
+      stopwatch.stop();
       flushResponse(done: true);
       _controller.stopStreamingMessage(responseId);
+      final elapsedMs = stopwatch.elapsedMilliseconds.clamp(1, 1 << 31);
+      final tokensPerSecond = outputTokens / elapsedMs * 1000;
+      debugPrint(
+        'NobodyWho metrics: output_tokens=$outputTokens '
+        'elapsed_ms=${stopwatch.elapsedMilliseconds} '
+        'first_token_ms=${firstTokenLatency?.inMilliseconds ?? 0} '
+        'tokens_per_second=${tokensPerSecond.toStringAsFixed(2)}',
+      );
+      if (mounted) {
+        setState(() {
+          _status = '${tokensPerSecond.toStringAsFixed(1)} tok/s';
+        });
+      }
     } catch (err) {
       _controller.updateMessage(
         ChatMessage(
@@ -142,7 +334,7 @@ class _ChatPageState extends State<ChatPage> {
       if (mounted) {
         setState(() {
           _isLoading = false;
-          if (_chat != null) _status = '就绪';
+          if (_chat == null) _status = '就绪';
         });
       }
     }
@@ -150,42 +342,363 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('NobodyWho Chat'),
-        actions: [
-          Center(
-            child: Padding(
-              padding: const EdgeInsets.only(right: 16),
-              child: Text(
-                _status,
-                style: Theme.of(context).textTheme.bodySmall,
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('NobodyWho Chat'),
+          bottom: TabBar(
+            onTap: (index) => setState(() => _tabIndex = index),
+            tabs: const [
+              Tab(text: '聊天'),
+              Tab(text: '账单'),
+            ],
+          ),
+          actions: [
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.only(right: 16),
+                child: Text(
+                  _status,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
               ),
             ),
+          ],
+        ),
+        body: _tabIndex == 0 ? _buildChat() : LedgerPage(ledger: _loadLedger()),
+      ),
+    );
+  }
+
+  Widget _buildChat() {
+    return AiChatWidget(
+      currentUser: _user,
+      aiUser: _ai,
+      controller: _controller,
+      onSendMessage: _send,
+      loadingConfig: LoadingConfig(isLoading: _isLoading),
+      messageOptions: MessageOptions(footerBuilder: buildThinkingFooter),
+      enableMarkdownStreaming: false,
+      streamingWordByWord: false,
+      inputOptions: const InputOptions(
+        decoration: InputDecoration(hintText: '问点什么...'),
+        sendOnEnter: true,
+      ),
+      welcomeMessageConfig: const WelcomeMessageConfig(
+        title: 'NobodyWho 本地聊天',
+        questionsSectionTitle: '可以试试：',
+      ),
+      exampleQuestions: const [
+        ExampleQuestion(question: '你是谁？用中文回答我。'),
+        ExampleQuestion(question: '用三句话解释本地大模型。'),
+      ],
+    );
+  }
+}
+
+class LedgerPage extends StatefulWidget {
+  const LedgerPage({super.key, required this.ledger});
+
+  final Future<ExpenseLedger> ledger;
+
+  @override
+  State<LedgerPage> createState() => _LedgerPageState();
+}
+
+class _LedgerPageState extends State<LedgerPage> {
+  late Future<List<TransactionEntry>> _entries = _loadEntries();
+
+  Future<List<TransactionEntry>> _loadEntries() async {
+    return (await widget.ledger).listTransactions();
+  }
+
+  void _reload() {
+    setState(() => _entries = _loadEntries());
+  }
+
+  Future<void> _edit(TransactionEntry entry) async {
+    final updated = await showDialog<TransactionEntry>(
+      context: context,
+      builder: (context) => TransactionDialog(entry: entry),
+    );
+    if (updated == null) return;
+    await (await widget.ledger).update(updated);
+    _reload();
+  }
+
+  Future<void> _delete(TransactionEntry entry) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('删除账单'),
+        content: Text('确定删除“${entry.title}”？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('删除'),
           ),
         ],
       ),
-      body: AiChatWidget(
-        currentUser: _user,
-        aiUser: _ai,
-        controller: _controller,
-        onSendMessage: _send,
-        loadingConfig: LoadingConfig(isLoading: _isLoading),
-        enableMarkdownStreaming: false,
-        streamingWordByWord: false,
-        inputOptions: const InputOptions(
-          decoration: InputDecoration(hintText: '问点什么...'),
-          sendOnEnter: true,
-        ),
-        welcomeMessageConfig: const WelcomeMessageConfig(
-          title: 'NobodyWho 本地聊天',
-          questionsSectionTitle: '可以试试：',
-        ),
-        exampleQuestions: const [
-          ExampleQuestion(question: '你是谁？用中文回答我。'),
-          ExampleQuestion(question: '用三句话解释本地大模型。'),
+    );
+    if (confirmed != true) return;
+    await (await widget.ledger).delete(entry);
+    _reload();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<List<TransactionEntry>>(
+      future: _entries,
+      builder: (context, snapshot) {
+        final entries = snapshot.data ?? const <TransactionEntry>[];
+        final summary = MonthlySummary.fromEntries(
+          entries,
+          month: DateTime.now(),
+        );
+
+        return Column(
+          children: [
+            _SummaryBar(summary: summary),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 8, 4),
+              child: Row(
+                children: [
+                  Text('账单明细', style: Theme.of(context).textTheme.titleMedium),
+                  const Spacer(),
+                  IconButton(
+                    tooltip: '刷新',
+                    onPressed: _reload,
+                    icon: const Icon(Icons.refresh),
+                  ),
+                ],
+              ),
+            ),
+            if (snapshot.connectionState == ConnectionState.waiting)
+              const Expanded(child: Center(child: CircularProgressIndicator()))
+            else if (entries.isEmpty)
+              const Expanded(child: Center(child: Text('暂无账单')))
+            else
+              Expanded(
+                child: ListView.separated(
+                  itemCount: entries.length,
+                  separatorBuilder: (_, _) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final entry = entries[index];
+                    final sign = entry.type == 'income' ? '+' : '-';
+                    return ListTile(
+                      title: Text('${entry.category} · ${entry.title}'),
+                      subtitle: Text(_entrySubtitle(entry)),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text('$sign${_formatAmount(entry.amount)}'),
+                          IconButton(
+                            tooltip: '编辑',
+                            onPressed: () => _edit(entry),
+                            icon: const Icon(Icons.edit_outlined),
+                          ),
+                          IconButton(
+                            tooltip: '删除',
+                            onPressed: () => _delete(entry),
+                            icon: const Icon(Icons.delete_outline),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _SummaryBar extends StatelessWidget {
+  const _SummaryBar({required this.summary});
+
+  final MonthlySummary summary;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+      child: Row(
+        children: [
+          _SummaryItem(label: '本月收入', value: summary.income),
+          _SummaryItem(label: '本月支出', value: summary.expense),
+          _SummaryItem(label: '本月结余', value: summary.balance),
         ],
       ),
     );
   }
+}
+
+class _SummaryItem extends StatelessWidget {
+  const _SummaryItem({required this.label, required this.value});
+
+  final String label;
+  final double value;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Expanded(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label, style: theme.textTheme.labelSmall),
+          Text(
+            _formatAmount(value),
+            style: theme.textTheme.titleMedium,
+            maxLines: 1,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class TransactionDialog extends StatefulWidget {
+  const TransactionDialog({super.key, required this.entry});
+
+  final TransactionEntry entry;
+
+  @override
+  State<TransactionDialog> createState() => _TransactionDialogState();
+}
+
+class _TransactionDialogState extends State<TransactionDialog> {
+  late final _occurredAt = TextEditingController(
+    text: widget.entry.occurredAtIso,
+  );
+  late final _type = TextEditingController(text: widget.entry.type);
+  late final _title = TextEditingController(text: widget.entry.title);
+  late final _amount = TextEditingController(
+    text: _formatAmount(widget.entry.amount),
+  );
+  late final _currency = TextEditingController(text: widget.entry.currency);
+  late final _category = TextEditingController(text: widget.entry.category);
+  late final _account = TextEditingController(text: widget.entry.account ?? '');
+  late final _note = TextEditingController(text: widget.entry.note ?? '');
+
+  @override
+  void dispose() {
+    _occurredAt.dispose();
+    _type.dispose();
+    _title.dispose();
+    _amount.dispose();
+    _currency.dispose();
+    _category.dispose();
+    _account.dispose();
+    _note.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    final amount = double.tryParse(_amount.text.trim());
+    if (amount == null) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('金额格式不对')));
+      return;
+    }
+    try {
+      Navigator.pop(
+        context,
+        TransactionEntry.fromToolArgs(
+          id: widget.entry.id,
+          createdAt: widget.entry.createdAt,
+          occurredAt: _occurredAt.text,
+          type: _type.text,
+          title: _title.text,
+          amount: amount,
+          currency: _currency.text,
+          category: _category.text,
+          account: _account.text,
+          note: _note.text,
+          rawText: widget.entry.rawText,
+        ),
+      );
+    } on Object catch (err) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('保存失败：$err')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('编辑账单'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _title,
+              decoration: const InputDecoration(labelText: '标题'),
+            ),
+            TextField(
+              controller: _amount,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: '金额'),
+            ),
+            TextField(
+              controller: _category,
+              decoration: const InputDecoration(labelText: '分类'),
+            ),
+            TextField(
+              controller: _type,
+              decoration: const InputDecoration(labelText: '类型 expense/income'),
+            ),
+            TextField(
+              controller: _account,
+              decoration: const InputDecoration(labelText: '账户'),
+            ),
+            TextField(
+              controller: _note,
+              decoration: const InputDecoration(labelText: '备注'),
+            ),
+            TextField(
+              controller: _occurredAt,
+              decoration: const InputDecoration(labelText: '发生时间'),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton(onPressed: _save, child: const Text('保存')),
+      ],
+    );
+  }
+}
+
+String _entrySubtitle(TransactionEntry entry) {
+  final chunks = [
+    _formatDateTime(entry.occurredAt),
+    if (entry.account != null) entry.account!,
+    if (entry.note != null) entry.note!,
+  ];
+  return chunks.join(' · ');
+}
+
+String _formatDateTime(DateTime value) {
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${value.year}-${two(value.month)}-${two(value.day)} '
+      '${two(value.hour)}:${two(value.minute)}';
+}
+
+String _formatAmount(double value) {
+  return value == value.roundToDouble()
+      ? value.toStringAsFixed(0)
+      : value.toStringAsFixed(2);
 }
