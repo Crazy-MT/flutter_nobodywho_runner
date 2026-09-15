@@ -26,6 +26,18 @@ void main() {
       parts = splitThinkBlocksForDisplay('<think>hidden</thi');
       expect(parts.thinking, 'hidden');
       expect(parts.answer, '');
+
+      parts = splitThinkBlocksForDisplay(r'<|channel|>scratch<\channel|>最终答案');
+      expect(parts.thinking, 'scratch');
+      expect(parts.answer, '最终答案');
+
+      parts = splitThinkBlocksForDisplay(r'<|channel|>scratch<\chan');
+      expect(parts.thinking, 'scratch');
+      expect(parts.answer, '');
+
+      parts = splitThinkBlocksForDisplay('回答前缀 <|chan');
+      expect(parts.thinking, '');
+      expect(parts.answer, '回答前缀 ');
     },
   );
 

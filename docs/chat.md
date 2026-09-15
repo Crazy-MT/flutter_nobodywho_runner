@@ -29,7 +29,7 @@
 
 ## 思考过程
 
-`splitThinkBlocksForDisplay()` 把 `<think>...</think>` 内容拆到 `thinking`，正文放到 `answer`。`buildThinkingFooter()` 在 AI 消息底部展示可折叠的思考过程，流式输出时默认展开，结束后折叠。
+`splitThinkBlocksForDisplay()` 把文本模型的 `<think>...</think>` 和多模态模型的 `<|channel>...<channel|>` 内容拆到 `thinking`，正文放到 `answer`。`buildThinkingFooter()` 在 AI 消息底部展示可折叠的思考过程，流式输出时默认展开，结束后折叠。
 
 ## 与记账模块的关系
 

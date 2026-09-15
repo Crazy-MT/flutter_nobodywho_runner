@@ -38,28 +38,30 @@ class ThinkParts {
 }
 
 ThinkParts splitThinkBlocksForDisplay(String text) {
-  const openTag = '<think>';
-  const closeTag = '</think>';
   final lower = text.toLowerCase();
   final answer = StringBuffer();
   final thinking = StringBuffer();
-  var hidden = false;
+  String? closeTag;
   var index = 0;
 
   while (index < text.length) {
-    if (!hidden && lower.startsWith(openTag, index)) {
-      hidden = true;
-      index += openTag.length;
+    if (closeTag == null) {
+      final openTag = _thinkingOpenTagAt(lower, index);
+      if (openTag != null) {
+        closeTag = _thinkingCloseTagFor(openTag);
+        index += openTag.length;
+        continue;
+      }
+    }
+    if (closeTag != null && lower.startsWith(closeTag, index)) {
+      final matchedCloseTag = closeTag;
+      closeTag = null;
+      index += matchedCloseTag.length;
       continue;
     }
-    if (hidden && lower.startsWith(closeTag, index)) {
-      hidden = false;
-      index += closeTag.length;
-      continue;
-    }
-    if (!hidden && _isPartialTagAtEnd(lower, index, openTag)) break;
-    if (hidden && _isPartialTagAtEnd(lower, index, closeTag)) break;
-    if (hidden) {
+    if (closeTag == null && _isPartialThinkingOpenTagAtEnd(lower, index)) break;
+    if (closeTag != null && _isPartialTagAtEnd(lower, index, closeTag)) break;
+    if (closeTag != null) {
       thinking.write(text[index]);
     } else {
       answer.write(text[index]);
@@ -71,6 +73,27 @@ ThinkParts splitThinkBlocksForDisplay(String text) {
     answer: answer.toString().replaceFirst(RegExp(r'^\s+'), ''),
     thinking: thinking.toString().trim(),
   );
+}
+
+String? _thinkingOpenTagAt(String lower, int index) {
+  const openTags = ['<think>', '<|channel>'];
+  for (final tag in openTags) {
+    if (lower.startsWith(tag, index)) return tag;
+  }
+  return null;
+}
+
+String _thinkingCloseTagFor(String openTag) {
+  return switch (openTag) {
+    '<think>' => '</think>',
+    '<|channel>' => r'<channel|>',
+    _ => throw ArgumentError.value(openTag, 'openTag'),
+  };
+}
+
+bool _isPartialThinkingOpenTagAtEnd(String lower, int index) {
+  const openTags = ['<think>', '<|channel>'];
+  return openTags.any((tag) => _isPartialTagAtEnd(lower, index, tag));
 }
 
 bool _isPartialTagAtEnd(String lower, int index, String tag) {
