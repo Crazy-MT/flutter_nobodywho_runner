@@ -326,6 +326,7 @@ class _ChatPageState extends State<ChatPage> {
           '当前时间是 ${DateTime.now().toIso8601String()}。'
           '当用户明确要求记账时，必须调用 record_transaction 工具保存收入或支出。'
           '提取 occurredAt、type、title、amount、currency、category、account、note、rawText；'
+          '注意分辨 expense or income，不要搞错；'
           '例如“三块钱早餐记账”应保存 type=expense, title=早餐, amount=3, currency=CNY, category=餐饮。',
       tools: [createRecordTransactionTool(_loadLedger())],
     );

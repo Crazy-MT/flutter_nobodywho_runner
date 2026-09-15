@@ -11,6 +11,15 @@
 - 自然语言记账：模型明确识别记账意图时调用 `record_transaction` Tool，把收入或支出写入本地 Floor 数据库。
 - 账单页：查看账单明细，支持刷新、编辑、删除，并展示本月收入、支出和结余。
 
+## 运行效果
+
+<p>
+  <img src="images/img.png" width="220" alt="运行效果图 1" />
+  <img src="images/img_1.png" width="220" alt="运行效果图 2" />
+  <img src="images/img_2.png" width="220" alt="运行效果图 3" />
+  <img src="images/img_3.png" width="220" alt="运行效果图 4" />
+</p>
+
 ## 关键文件
 
 - `lib/main.dart`：应用入口、聊天 UI、模型加载、附件处理、账单 Tab。
