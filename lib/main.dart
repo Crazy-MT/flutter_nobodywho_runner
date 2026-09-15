@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_gen_ai_chat_ui/flutter_gen_ai_chat_ui.dart';
 import 'package:flutter/services.dart';
@@ -7,6 +8,8 @@ import 'package:nobodywho/nobodywho.dart' as nobodywho;
 import 'package:nobodywho_android_runner/accounting.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+
+const _assetChannel = MethodChannel('nobodywho_android_runner/assets');
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -74,6 +77,64 @@ bool _isPartialTagAtEnd(String lower, int index, String tag) {
   final remaining = lower.length - index;
   if (remaining >= tag.length) return false;
   return tag.startsWith(lower.substring(index));
+}
+
+enum AttachmentKind { image, audio }
+
+enum ModelChoice { text, multimodal }
+
+extension ModelChoiceInfo on ModelChoice {
+  String get label => switch (this) {
+    ModelChoice.text => '文本模型',
+    ModelChoice.multimodal => '多模态模型',
+  };
+
+  String get modelAssetPath => switch (this) {
+    ModelChoice.text => 'assets/model.gguf',
+    ModelChoice.multimodal => 'assets/multimodal/gemma-4-E2B-it-Q4_K_M.gguf',
+  };
+
+  String? get projectionAssetPath => switch (this) {
+    ModelChoice.text => null,
+    ModelChoice.multimodal => 'assets/multimodal/mmproj-BF16.gguf',
+  };
+
+  bool get supportsAttachments => this == ModelChoice.multimodal;
+}
+
+class PickedAttachment {
+  const PickedAttachment({
+    required this.path,
+    required this.name,
+    required this.kind,
+  });
+
+  final String path;
+  final String name;
+  final AttachmentKind kind;
+}
+
+List<nobodywho.PromptPart> buildPromptParts(
+  String text,
+  List<PickedAttachment> attachments,
+) {
+  final trimmed = text.trim();
+  return [
+    if (trimmed.isNotEmpty) nobodywho.TextPart(trimmed),
+    for (final attachment in attachments)
+      switch (attachment.kind) {
+        AttachmentKind.image => nobodywho.ImagePart(attachment.path),
+        AttachmentKind.audio => nobodywho.AudioPart(attachment.path),
+      },
+  ];
+}
+
+String buildUserMessageText(String text, List<PickedAttachment> attachments) {
+  final trimmed = text.trim();
+  final names = attachments.map((a) => a.name).join('\n');
+  if (trimmed.isEmpty) return names;
+  if (names.isEmpty) return trimmed;
+  return '$trimmed\n$names';
 }
 
 Widget? buildThinkingFooter(
@@ -187,6 +248,8 @@ class _ChatPageState extends State<ChatPage> {
 
   nobodywho.Chat? _chat;
   Future<ExpenseLedger>? _ledger;
+  final List<PickedAttachment> _attachments = [];
+  ModelChoice _modelChoice = ModelChoice.multimodal;
   bool _isLoading = false;
   int _tabIndex = 0;
   String _status = '首次提问时加载模型';
@@ -199,40 +262,60 @@ class _ChatPageState extends State<ChatPage> {
 
   Future<nobodywho.Chat> _loadChat() async {
     final existing = _chat;
-    if (existing != null) return existing;
+    if (existing != null) {
+      _logLoad('reuse loaded chat');
+      return existing;
+    }
+
+    final modelChoice = _modelChoice;
+    final total = Stopwatch()..start();
+    _logLoad('start loading chat: ${modelChoice.label}');
 
     setState(() {
       _isLoading = true;
-      _status = '正在加载模型...';
+      _status = '正在加载${modelChoice.label}...';
     });
 
+    _logLoad('get documents directory start');
     final dir = await getApplicationDocumentsDirectory();
-    final model = File('${dir.path}/model.gguf');
+    _logLoad('documents directory: ${dir.path}');
+    final model = await _copyAssetToDocuments(dir, modelChoice.modelAssetPath);
+    final projectionAssetPath = modelChoice.projectionAssetPath;
+    final projection = projectionAssetPath == null
+        ? null
+        : await _copyAssetToDocuments(dir, projectionAssetPath);
 
-    if (!await model.exists()) {
-      final data = await rootBundle.load('assets/model.gguf');
-      await model.writeAsBytes(data.buffer.asUint8List(), flush: true);
-    }
-
-    final chat = await nobodywho.Chat.fromPath(
+    _logLoad('Model.load start: ${modelChoice.label}');
+    _setStatus('正在初始化${modelChoice.label}...');
+    final loadedModel = await nobodywho.Model.load(
       modelPath: model.path,
+      projectionModelPath: projection?.path,
+    );
+    _logLoad('Model.load done in ${total.elapsedMilliseconds}ms');
+
+    _logLoad('Chat create start');
+    final chat = nobodywho.Chat(
+      model: loadedModel,
       templateVariables: {'enable_thinking': true},
       systemPrompt:
           '你是一个简洁、可靠的中文助手。'
+          '${modelChoice.supportsAttachments ? '你可以直接理解用户上传的图片和音频。' : ''}'
           '当前时间是 ${DateTime.now().toIso8601String()}。'
           '当用户明确要求记账时，必须调用 record_transaction 工具保存收入或支出。'
           '提取 occurredAt、type、title、amount、currency、category、account、note、rawText；'
           '例如“三块钱早餐记账”应保存 type=expense, title=早餐, amount=3, currency=CNY, category=餐饮。',
       tools: [createRecordTransactionTool(_loadLedger())],
     );
+    _logLoad('Chat create done in ${total.elapsedMilliseconds}ms');
 
     if (mounted) {
       setState(() {
         _chat = chat;
-        _status = '就绪';
+        _status = '${modelChoice.label}就绪 ${total.elapsed.inSeconds}s';
       });
     }
 
+    _logLoad('load chat finished in ${total.elapsedMilliseconds}ms');
     return chat;
   }
 
@@ -247,11 +330,106 @@ class _ChatPageState extends State<ChatPage> {
     return future;
   }
 
+  Future<File> _copyAssetToDocuments(Directory dir, String assetPath) async {
+    final stopwatch = Stopwatch()..start();
+    final file = File(p.join(dir.path, p.basename(assetPath)));
+    _logLoad('asset check: $assetPath -> ${file.path}');
+    if (await file.exists()) {
+      final size = await file.length();
+      _logLoad(
+        'asset already copied: ${file.path}, size=$size bytes, '
+        'elapsed=${stopwatch.elapsedMilliseconds}ms',
+      );
+      return file;
+    }
+
+    _setStatus('正在复制 ${p.basename(assetPath)}...');
+    if (Platform.isAndroid) {
+      _logLoad('native asset copy start: $assetPath');
+      final bytes = await _assetChannel.invokeMethod<int>('copyAssetToFile', {
+        'assetPath': assetPath,
+        'destinationPath': file.path,
+      });
+      _logLoad(
+        'native asset copy done: $assetPath, '
+        'bytes=$bytes, elapsed=${stopwatch.elapsedMilliseconds}ms',
+      );
+      return file;
+    }
+
+    _logLoad('rootBundle.load start: $assetPath');
+    final data = await rootBundle.load(assetPath);
+    _logLoad(
+      'rootBundle.load done: $assetPath, '
+      'size=${data.lengthInBytes} bytes, elapsed=${stopwatch.elapsedMilliseconds}ms',
+    );
+    _logLoad('write file start: ${file.path}');
+    await file.writeAsBytes(data.buffer.asUint8List(), flush: true);
+    _logLoad(
+      'write file done: ${file.path}, '
+      'elapsed=${stopwatch.elapsedMilliseconds}ms',
+    );
+    return file;
+  }
+
+  void _setStatus(String status) {
+    if (!mounted) return;
+    setState(() => _status = status);
+  }
+
+  void _logLoad(String message) {
+    debugPrint('[NobodyWhoLoad ${DateTime.now().toIso8601String()}] $message');
+  }
+
+  Future<void> _pickAttachment(AttachmentKind kind) async {
+    final file = await FilePicker.pickFile(
+      type: FileType.custom,
+      allowedExtensions: kind == AttachmentKind.image
+          ? ['jpg', 'jpeg', 'png', 'webp']
+          : ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg'],
+    );
+    if (file?.path == null) return;
+    setState(() {
+      _attachments.add(
+        PickedAttachment(path: file!.path!, name: file.name, kind: kind),
+      );
+    });
+  }
+
+  void _removeAttachment(PickedAttachment attachment) {
+    setState(() => _attachments.remove(attachment));
+  }
+
+  void _switchModel(ModelChoice choice) {
+    if (_isLoading || choice == _modelChoice) return;
+    setState(() {
+      _modelChoice = choice;
+      _chat = null;
+      if (!choice.supportsAttachments) _attachments.clear();
+      _status = '已切换到${choice.label}';
+    });
+    _logLoad('model switched: ${choice.label}');
+  }
+
   Future<void> _send(ChatMessage message) async {
     if (_isLoading) return;
+    final attachments = List<PickedAttachment>.of(_attachments);
+    if (attachments.isNotEmpty && !_modelChoice.supportsAttachments) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('当前模型不支持图片/音频，请切换到多模态模型')));
+      return;
+    }
+    final text = buildUserMessageText(message.text, attachments);
+    final promptParts = buildPromptParts(message.text, attachments);
+    if (promptParts.isEmpty) return;
+
+    setState(() => _attachments.clear());
 
     _controller.addMessage(
       message.copyWith(
+        text: text,
+        media: _chatMedia(attachments),
         customProperties: {'isUserMessage': true, 'source': 'user'},
       ),
     );
@@ -298,7 +476,15 @@ class _ChatPageState extends State<ChatPage> {
       final stopwatch = Stopwatch()..start();
       var outputTokens = 0;
       Duration? firstTokenLatency;
-      await for (final token in chat.ask(message.text)) {
+      final stream = attachments.isEmpty
+          ? chat.ask(message.text.trim())
+          : chat.askWithPrompt(nobodywho.Prompt(promptParts));
+      debugPrint(
+        '[NobodyWhoAsk ${DateTime.now().toIso8601String()}] '
+        'start stream, attachments=${attachments.length}, '
+        'text_length=${message.text.trim().length}',
+      );
+      await for (final token in stream) {
         firstTokenLatency ??= stopwatch.elapsed;
         outputTokens++;
         buffer.write(token);
@@ -340,6 +526,33 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  List<ChatMedia>? _chatMedia(List<PickedAttachment> attachments) {
+    if (attachments.isEmpty) return null;
+    return attachments
+        .map(
+          (attachment) => ChatMedia(
+            url: attachment.path,
+            fileName: attachment.name,
+            type: switch (attachment.kind) {
+              AttachmentKind.image => ChatMediaType.image,
+              AttachmentKind.audio => ChatMediaType.audio,
+            },
+            customBuilder: attachment.kind == AttachmentKind.image
+                ? (context, media) => ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: Image.file(
+                      File(media.url),
+                      width: 180,
+                      height: 140,
+                      fit: BoxFit.cover,
+                    ),
+                  )
+                : null,
+          ),
+        )
+        .toList();
+  }
+
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
@@ -355,6 +568,38 @@ class _ChatPageState extends State<ChatPage> {
             ],
           ),
           actions: [
+            PopupMenuButton<ModelChoice>(
+              tooltip: '切换模型',
+              enabled: !_isLoading,
+              initialValue: _modelChoice,
+              onSelected: _switchModel,
+              itemBuilder: (context) => [
+                for (final choice in ModelChoice.values)
+                  PopupMenuItem(
+                    value: choice,
+                    child: Row(
+                      children: [
+                        Icon(
+                          choice == _modelChoice ? Icons.check : null,
+                          size: 18,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(choice.label),
+                      ],
+                    ),
+                  ),
+              ],
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Row(
+                  children: [
+                    const Icon(Icons.memory_outlined),
+                    const SizedBox(width: 4),
+                    Text(_modelChoice.label),
+                  ],
+                ),
+              ),
+            ),
             Center(
               child: Padding(
                 padding: const EdgeInsets.only(right: 16),
@@ -381,9 +626,11 @@ class _ChatPageState extends State<ChatPage> {
       messageOptions: MessageOptions(footerBuilder: buildThinkingFooter),
       enableMarkdownStreaming: false,
       streamingWordByWord: false,
-      inputOptions: const InputOptions(
-        decoration: InputDecoration(hintText: '问点什么...'),
+      inputOptions: InputOptions(
+        decoration: const InputDecoration(hintText: '问点什么...'),
         sendOnEnter: true,
+        inputLeadingBuilder: _buildAttachmentButtons,
+        attachmentPreviewBuilder: _buildAttachmentPreview,
       ),
       welcomeMessageConfig: const WelcomeMessageConfig(
         title: 'NobodyWho 本地聊天',
@@ -393,6 +640,55 @@ class _ChatPageState extends State<ChatPage> {
         ExampleQuestion(question: '你是谁？用中文回答我。'),
         ExampleQuestion(question: '用三句话解释本地大模型。'),
       ],
+    );
+  }
+
+  Widget _buildAttachmentButtons(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          tooltip: '选择图片',
+          onPressed: _isLoading || !_modelChoice.supportsAttachments
+              ? null
+              : () => _pickAttachment(AttachmentKind.image),
+          icon: const Icon(Icons.image_outlined),
+        ),
+        IconButton(
+          tooltip: '选择音频',
+          onPressed: _isLoading || !_modelChoice.supportsAttachments
+              ? null
+              : () => _pickAttachment(AttachmentKind.audio),
+          icon: const Icon(Icons.audio_file_outlined),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAttachmentPreview(BuildContext context) {
+    if (_attachments.isEmpty) return const SizedBox.shrink();
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (final attachment in _attachments)
+              InputChip(
+                avatar: Icon(
+                  attachment.kind == AttachmentKind.image
+                      ? Icons.image_outlined
+                      : Icons.audio_file_outlined,
+                  size: 18,
+                ),
+                label: Text(attachment.name, overflow: TextOverflow.ellipsis),
+                onDeleted: () => _removeAttachment(attachment),
+              ),
+          ],
+        ),
+      ),
     );
   }
 }
