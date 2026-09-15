@@ -28,6 +28,14 @@
 - `assets/multimodal/gemma-4-E2B-it-Q4_K_M.gguf`：多模态模型。
 - `assets/multimodal/mmproj-BF16.gguf`：多模态 projection 模型。
 
+模型文件不提交到 GitHub。克隆仓库后运行：
+
+```bash
+./scripts/download_models.sh
+```
+
+脚本会从 Hugging Face 下载模型到上述路径。
+
 运行时会把模型从 assets 复制到应用 documents 目录。Android 使用原生 `MethodChannel('nobodywho_android_runner/assets')` 加速复制；其他平台回退到 `rootBundle.load`。
 
 ## 开发命令
